@@ -1,0 +1,290 @@
+---
+title: "Zoning and Rent Prices in New York City"
+author: "Jacob Indursky"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: 
+  pdf_document:
+    keep_tex: false
+    fig_caption: true
+    latex_engine: pdflatex
+header-includes:
+  -  \usepackage{hyperref}
+  - \usepackage{placeins}
+biblio-style: apsr
+geometry: margin=1in
+fontfamily: mathpazo
+fontsize: 11pt
+# spacing: double
+endnote: no
+urlcolor: blue
+---
+
+# 0. NOTE FOR DOW JONES FUND
+
+The below PDF is built from R Markdown - I updated the knit options to show the code in the PDF
+as well. This project was done for my SIPA Policy class using R. I had a partner who took the
+class pass/fail, so she was not required to work on this final report with me, but helped
+with finding and cleaning the ACS data, which happens in another script.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r load}
+load("report_template.RData")
+```
+
+# 1. Introduction
+
+Upzonings increase allowable density by relaxing the zoning code on height and increasing floor area ratio. It is often proposed as a solution to improve housing affordability. 
+  In New York City, upzoning is seen as a common tool to add to the housing supply by allowing for more densely populated residential areas. For example, the proposed upzoning of SoHo/NoHo was recently approved by the [City Council](https://www1.nyc.gov/site/planning/plans/soho-noho/soho-noho-overview.page?utm_medium=website&utm_source=archdaily.com) to “expand housing opportunities for New Yorkers and promote equity, support continued cultural and economic success in a holistic way and reduce regulatory burdens for the people who live and work there.”
+  However, it’s unclear the impact that past upzonings have had on rent. Upzoning is seen as a solution for all areas - but it could very likely have a different impact on rent depending on the characteristics of the neighborhood where the upzoning occurrs. Our analysis will seek to find a causal relationship between upzonings and rent.
+
+
+# 3. Data description
+
+## 3.1 Rental Data 
+
+They key dependent variable is median rent. Rental data is from the American Community Survey’s (ACS) five year estimated data profile on housing characteristics, years 2017-2020. While the 5-year estimates are more reliable, they are not as current as 1-year estimates. The unit of observation is a census tract. 
+
+## 3.2 Zoning Data
+
+Zoning data comes from the Department of City Planning and its Primary Land 
+Use Tax Lot Output (PLUTO™) data file, which contains extensive land use and
+geographic data at the tax lot level. Tax lots are defined as a parcel of
+real property, and can be aggregated to the census tract level. The key dependent variable being used is Total Allowable Residential Area (TARA), which is a derived variable created from two raw variables: Lot Area and 
+Residential Floor to Area Ratio (RESIDFAR). 
+  + Lot Area: Total area of tax lot (sq. ft)
+  + RESIDFAR: maximum allowable residential floor area ratio, based on the zoning district classification occupying the greatest percentage of the tax lot’s area as reported in the Zoning District 1 (the largest zoned area in the lot).
+
+\newpage
+
+# 4. Descriptive statistics
+
+ 
+```{r results=FALSE, message=FALSE}
+library(tidyverse)
+library(fixest)
+library(modelsummary)
+library(stargazer)
+library(kableExtra)
+library(lmtest)
+library(multiwayvcov)
+library(sandwich)
+
+
+zoning_rent.tract <- readRDS("CombinedData.RData")
+```
+
+
+
+```{r ggplot 1}
+zoning_rent.tract %>% 
+  ggplot(aes(median_rent, color = as.factor(YEAR))) +
+  geom_density() +
+  scale_color_discrete(name = "Year") +
+  ggtitle("Proportion of Rent by Year", subtitle = "ACS Data, 2017-2020") +
+  labs(x = "Median Rent ($)", y = "Density")
+```
+
+\medspace 
+
+We can see that rent across census tracts is relatively normally distributed, and in both the above graph and below graph, increasing over time.
+
+
+
+```{r ggplot 2}
+zoning_rent.tract %>% 
+  group_by(BOROUGH, YEAR) %>%
+  summarise(median_rent = mean(median_rent)) %>%
+  ggplot(aes(x=YEAR, y=median_rent, color = BOROUGH)) +
+  geom_line() +
+  ggtitle("Average Rent by Borough", subtitle = "ACS Data, 2017-2020") +
+  labs(x = "Year", y = "Rent ($)")
+```
+
+## 4.2 Zoning Data
+
+The below table provides insight into the yearly variation of allowable residential area in tax blocks. We can see that although the majority of tax blocks remain unchanged over time, there is still variation over time and place.
+
+```{r Freq table}
+freq_table <- zoning_rent.tract %>%
+  group_by(YEAR, round(RESAREA_YOY/1000000,0)) %>%
+  summarize(freq = n())
+
+colnames(freq_table) <- c("Year", "YoY Change in Area", "Frequency")
+
+freq_table <- pivot_wider(freq_table, names_from = "Year", values_from = "Frequency")  %>%
+  arrange(desc("YoY Change in Area"))
+  
+kable(freq_table, 
+      align = "l",
+      caption = "Count of Census Tracts by Yearly Change in Residential Area (0000000s)") %>% 
+      kable_paper("hover", 
+                  full_width = F, 
+                  html_font = "Helvetica") %>% 
+      kable_styling(font_size = 20)
+```
+
+\newpage
+
+We also wanted to try and look at specific examples of rezoning, to see if we could see anecdotal evidence of a relationship between zoning changes and rental prices. Consulting the [NYC Rezoning Commitments](https://www1.nyc.gov/site/operations/performance/neighborhood-rezoning-commitments-tracker.page), there are several rezonings to consider. These are limited to neighborhood scale rezonings, but from speaking to an urban planner for the city government, we know that there a hundreds of smaller scale rezonings that take place yearly. We pulled out a select few census tracts from the [Jerome Avenue rezoning](https://www1.nyc.gov/assets/planning/download/pdf/plans-studies/jerome-ave/open-house/march/neighborhood-profile.pdf), as it happened in 2018, so the hope was we would have enough time for rental prices to react. The below scatter plot shows the relationship between allowable residential area and rent in three census tracts:
+
+
+
+```{r}
+zoning_rent.tract %>%
+  filter(CT2010 %in% c(217, 227.01, 233.01) & BOROUGH == "BX") %>%
+  ggplot(aes(x = totarea, y = median_rent, color = as.factor(CT2010))) +
+  geom_point() +
+  ggtitle("Jerome Avenue Rezoning (2017-2020)", subtitle = "Select Census Tracts") +
+  labs(x = "TARA", y = " Median Rent ($)")
+```
+
+In this example, we see a positive relationship between an increase in residential zoning area and median rent, which may point to some reverse causality concerns. One area for exploration (to be discussed in next steps), is to add in more years of rental data so we can see if rent is trending up before the rezoning, and the rezoning serves to change or slow that trend. 
+
+
+
+We do see this trend hold across our full sample, with higher density areas, on average, showing higher rent prices. While the results for the difference in means test could be do to higher density areas on average, being wealthier, the anecdotal test from Jerome Avenue shows that, at least for some areas, even within a given tract, an increase in density can be associated with an increase in rent. The combination of these results can lead us to believe we may have both OVB and reverse causality concerns to face in this study. 
+
+
+```{r means_table}
+zoning_diff <- zoning_rent.tract %>%
+  ungroup() %>%
+  mutate(treat = as.factor(ifelse(density == 1, 
+                                         "High-Density", 
+                                         "Low-Density"))) %>%
+  select(treat, median_rent)
+
+#show diff between treatment groups (high/low elig.) in AFDC rate & controls
+datasummary_balance(~treat,
+                    data = zoning_diff,
+                    fmt = 2,
+                    dinm_statistic = "p.value",
+                    title = "Difference-in-means for Rent for High Density vs. Low Density Tracts",
+                    notes = "Note: High density defined as buildable res. area greater than 2.2 sq ft (100,000s).")
+```
+
+
+Additionally, we wanted to see if there was a relationship between upzoning and density - the below table shows that on average, higher density areas tend to experience more increases in zoning as well.  
+
+```{r means_table 2}
+zoning_diff <- zoning_rent.tract %>%
+  ungroup() %>%
+  mutate(treat = as.factor(ifelse(density == 1, 
+                                         "High-Density", 
+                                         "Low-Density"))) %>%
+  select(treat, RESAREA_YOY)
+
+#show diff between treatment groups (high/low elig.) in AFDC rate & controls
+datasummary_balance(~treat,
+                    data = zoning_diff,
+                    fmt = 2,
+                    dinm_statistic = "p.value",
+                    title = "Difference-in-means for Zoning Changes for High Density vs. Low Density Tracts",
+                    notes = "Note: High density defined as buildable res. area greater than 2.2 sq ft (100,000s).")
+```
+
+
+\newpage
+
+# 5. Empirical strategy
+
+Our base regression estimates a PRF for the following tract and year fixed effects model:
+
+$$Y_{ct} = \beta_{1} TARA_{ct} + X_{ct}' \gamma + \mu_s + \tau_t + \varepsilon_{ct}$$
+
+where $Y_{ct}$ is the outcome of interest (rent prices, in dollars) in census tract $c$ and year $t$; $TARA_{ct}$ is a continuous variable measuring that Total Allowable Residential Area for a given tract-year; $X_{ct}$ is a vector of time-varying controls (as of now, just pop-white, but to include income, voter turnout, and political affiliation ); $\mu_c$ represents tract fixed effects; $\tau_{t}$ represents year fixed effects; and $\varepsilon_{ct}$ is an idiosyncratic error term.
+
+\newpage
+
+# 6. Findings
+
+```{r regression output}
+zoning_rent.tract <- zoning_rent.tract %>%
+  mutate(totarea_scale = totarea/100000,
+         percent_white = as.numeric(percent_white))
+
+models <- list(
+  "OLS 1" = feols(median_rent ~ log(totarea_scale),
+              data = zoning_rent.tract),
+  "OLS 2" = feols(median_rent ~ log(totarea_scale) + percent_white,
+              data = zoning_rent.tract),
+  "FE 1" = feols(median_rent ~ log(totarea_scale) + percent_white
+              | BCT, data = zoning_rent.tract),
+  "FE 2" = feols(median_rent ~ log(totarea_scale) + percent_white
+              | YEAR, data = zoning_rent.tract),
+  "FE 3" = feols(median_rent ~ log(totarea_scale) + percent_white
+              | YEAR + BCT, data = zoning_rent.tract)
+  )
+
+gm <- tibble::tribble(
+    ~raw,        ~clean,          ~fmt,
+    "nobs",               "N",                  0,
+    "r.squared",          "R<sup>2</sup>",      3,
+    "adj.r.squared",      "Adj. R<sup>2</sup>", 3,
+    "FE: BCT",         "Tract FEs",          0,
+    "FE: YEAR",    "YEAR FEs",    0
+    )
+
+#display results with added formatting options    
+modelsummary(models,
+             coef_omit = 'Intercept',
+             coef_rename = c("totarea_scale" = "Allowable Res. Area (100000s sq ft.)", 
+                             "percent_white" = "Percent White"
+                             ),
+             gof_map = gm,
+             title = 'Effect of Allowable Residential Area and Rent',
+             stars = c('*' = .1, '**' = .05, '***' = .01),
+             )
+```
+
+- There is initially a positive association between allowable res. building area and rent, as we saw in our difference in means table
+- Once we include tract-level fixed effects though, the statistically significant association disappears - this indicates that there may be an OVB problem as we expected with areas that are rezoned.
+
+\newpage
+
+# 7. Conclusion
+
+## Limitations
+
+- The largest limitation for this analysis is its internal validity:
+  + OVB: There are likely a host of factors that are correlated with both zoning changes and rent prices, and given New York's changing demographics, many of these factors will likely not be controlled for using a 
+fixed effects model
+  + In a similar vein, there is likely a reverse causality issue, where areas that are increasing in price are
+  more likely to be upzoned
+  
+- There are several other limitations we face around data, specifically:
+  + Zoning is NYC is extremely complex, and isolating the impact of zoning changes through our measure 
+  may be overly simplistic 
+  + Additionally, we are currently working with only 4 years of data, due to several corrupted files on the 
+  DCP website, which limits our potential variation
+  + ACS 5-year estimates are more reliable, but not as current as 1-year estimates
+  
+## Next Steps {.build}
+
+- Expand data horizontally and vertically
+  + We plan to add in more controls that likely vary over time and place
+  + We want to re-explore data on zoning to see if there is any way to add in years going further back
+
+- Explore a time-lagged analysis, where the impact of zoning may be felt further down the road
+
+- Explore any potential interaction effects as well, in terms of zoning and how it affects certain areas 
+differently than others
+
+Additionally, given the difficulties of isolating a causal impact on zonings, it may also make sense to explore potential natural experiments. Because we actually do have a decent amount of tract-level variation, one avenue that could be considered is comparing rental price changes between tracts that are next to each other that are and are not upzoned. This path may run into similar issues where a tract that is upzoned vs. not upzoned may have some characteristics that influence its upzoning. However, it could be helpful in controlling for other factors that may vary too heavily across the city otherwise.  
+
+
+\newpage
+
+# 8. References
+
+https://www.planning.org/blog/9219556/measuring-the-early-impact-of-eliminating-single-family-zoning-on-minneapolis-property-values/#:~:text=The%20Minneapolis%20city%20council%20voted,for%20triplexes%20on%20these%20properties.
+
+https://www1.nyc.gov/site/operations/performance/neighborhood-rezoning-commitments-tracker.page
+
+https://www1.nyc.gov/site/planning/plans/soho-noho/soho-noho-overview.page?utm_medium=website&utm_source=archdaily.com
+
+
+
